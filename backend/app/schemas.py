@@ -29,3 +29,18 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+    # 动作参数（如迟到重判所选确认时刻依据），领域服务按需读取。
+    basis: dict[str, Any] = Field(default_factory=dict)
+
+
+class LateClassifyPayload(BaseModel):
+    # 留空时复用该策略最近一次判定的事件输入（供进度补到后复核）
+    events: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class LateRejudgePayload(BaseModel):
+    # 值班员当次选择的确认时刻依据；`time_basis` 与 `confirmed_at` 等价。
+    confirmed_at: float | None = None
+    time_basis: float | None = None
+    operator: str | None = None
+    note: str = ""

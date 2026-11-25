@@ -71,6 +71,7 @@ class WatermarkService(BaseModuleService):
 
         # 同步到store
         store.update_watermark(partition, {"offset": current_offset + 50, "ts": time.time(), "lag_seconds": lag})
+        progress = store.watermark_progress(partition)
 
         return {
             "ok": True,
@@ -79,17 +80,24 @@ class WatermarkService(BaseModuleService):
             "status": status,
             "lag_seconds": round(lag, 1),
             "current_offset": current_offset + 50,
+            "confirmation_version": progress["version"],
         }
 
     def emit_watermark_for_late_data(self, source_id: str) -> dict[str, Any]:
-        """向 late_data 暴露当前水位信息，用于判定迟到数据"""
-        wm_data = store.get_watermark(source_id) or {}
+        """向 late_data 暴露当前已确认进度，用于判定迟到数据。
+
+        确认时刻只随位点真正前进而变更，``confirmation_version`` 用于让下游判定
+        与某一次确认对齐；缺少可靠确认时刻时 ``confirmed=False``，下游保留待判定。
+        """
+        progress = store.watermark_progress(source_id)
         return {
             "ok": True,
             "source": source_id,
-            "current_offset": wm_data.get("offset", 0),
-            "lag_seconds": wm_data.get("lag_seconds", 0),
-            "last_update": wm_data.get("ts", time.time()),
+            "current_offset": progress["offset"],
+            "confirmation_version": progress["version"],
+            "confirmed": progress["confirmed"],
+            "lag_seconds": (store.get_watermark(source_id) or {}).get("lag_seconds", 0),
+            "last_update": progress["last_update"],
             "downstream_consumer": "late_data",
         }
 

@@ -1,4 +1,4 @@
-import { request } from './client'
+import { fetchJson, request } from './client'
 import { moduleMeta } from '@/data/modules'
 import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
 
@@ -29,12 +29,73 @@ export async function runAction(
   key: string,
   id: number,
   action: string,
+  basis: Record<string, unknown> = {},
 ): Promise<ActionResult> {
   const response = await request(`/api/${key}/${id}/actions`, {
     method: 'POST',
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({ action, ...(Object.keys(basis).length ? { basis } : {}) }),
   })
   return await response.json()
+}
+
+export type LateSideOutputRow = {
+  event_id: string
+  event_ts: number | null
+  delay: number | null
+  reason: string
+  confirmed_at: number | null
+  confirmation_version: number | null
+}
+
+export type LateSideOutputResult = {
+  ok: boolean
+  total: number
+  items: LateSideOutputRow[]
+}
+
+export type LateEventRow = {
+  event_id: string
+  event_ts: number | null
+  classification: string
+  delay: number | null
+  reason: string
+  original_classification?: Record<string, unknown> | null
+  classification_history?: Record<string, unknown>[]
+  confirmation: { offset: number | null; version: number | null; confirmed: boolean }
+}
+
+export type LateEventResult = {
+  ok: boolean
+  total: number
+  items: LateEventRow[]
+}
+
+export type LateRejudgeResult = {
+  ok: boolean
+  rejudge: {
+    rejudge_id: number
+    status: string
+    basis: { confirmed_at: number | null; requested_by: string; requested_at: number; note: string }
+    result?: {
+      time_basis: number | null
+      confirmation_version: number | null
+      side_output_added: string[]
+      side_output_removed: string[]
+      by_event: Record<string, unknown>[]
+    } | null
+  } | null
+}
+
+export async function loadLateSideOutput(id: number): Promise<LateSideOutputResult> {
+  return await fetchJson<LateSideOutputResult>(`/api/late_data/${id}/side-output`)
+}
+
+export async function loadLateEvents(id: number): Promise<LateEventResult> {
+  return await fetchJson<LateEventResult>(`/api/late_data/${id}/events`)
+}
+
+export async function loadLateRejudge(id: number): Promise<LateRejudgeResult> {
+  return await fetchJson<LateRejudgeResult>(`/api/late_data/${id}/rejudge`)
 }
 
 export async function downloadEntries(

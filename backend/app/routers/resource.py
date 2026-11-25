@@ -8,7 +8,14 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import (
+    ActionPayload,
+    ActionResult,
+    EntryPayload,
+    LateClassifyPayload,
+    LateRejudgePayload,
+    PageResult,
+)
 from app.services import service_for
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -94,5 +101,49 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
+    values = {"basis": payload.basis} if payload.basis else {}
+    entry, message = service.run_action(entry_id, payload.action.strip(), values)
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+# ---------- 迟到数据链路专用查询/执行入口 ----------
+# 静态子路径必须放在 /{module}/{entry_id} 之前，避免被 entry_id 动态段抢先匹配。
+@router.get("/late_data/{entry_id}/side-output", response_model=dict)
+def late_data_side_output(entry_id: int) -> dict[str, Any]:
+    service = require_service("late_data")
+    result = service.query_side_output(entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("reason", "侧输出查询失败"))
+    return result
+
+
+@router.get("/late_data/{entry_id}/events", response_model=dict)
+def late_data_events(entry_id: int) -> dict[str, Any]:
+    service = require_service("late_data")
+    result = service.query_late_events(entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("reason", "迟到事件查询失败"))
+    return result
+
+
+@router.get("/late_data/{entry_id}/rejudge", response_model=dict)
+def late_data_rejudge(entry_id: int) -> dict[str, Any]:
+    service = require_service("late_data")
+    result = service.query_rejudge(entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("reason", "重判查询失败"))
+    return result
+
+
+@router.post("/late_data/{entry_id}/classify", response_model=dict)
+def late_data_classify(entry_id: int, payload: LateClassifyPayload) -> dict[str, Any]:
+    service = require_service("late_data")
+    return service.classify_late_events(entry_id, payload.events or None)
+
+
+@router.post("/late_data/{entry_id}/rejudge", response_model=dict)
+def late_data_request_rejudge(entry_id: int, payload: LateRejudgePayload) -> dict[str, Any]:
+    service = require_service("late_data")
+    # 允许请求体直接给 confirmed_at，也兼容包一层 basis。
+    body = payload.model_dump()
+    return service.request_rejudge(entry_id, body)

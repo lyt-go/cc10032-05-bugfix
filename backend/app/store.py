@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from typing import Any
 
@@ -127,6 +128,21 @@ class Store:
         self._schema_registry: dict[str, list[dict[str, Any]]] = {}
         # 水位偏移记录（watermark → late_data 共享）
         self._watermark_offsets: dict[str, dict[str, Any]] = {}
+        # 消费进度确认版本：水位每次真正推进才递增；迟到判定一次只取一个版本
+        self._watermark_version = 0
+        # 全局重入锁：水位版本与迟到判定回写必须原子，避免并发更新串版本
+        self._store_lock = threading.RLock()
+        # 迟到事件清单（分类结果回写，旧分类保留用于复核）
+        self._late_events: list[dict[str, Any]] = []
+        # 迟到侧输出（只保存当前有效的迟到行，失效行保留审计标记）
+        self._late_side_output: list[dict[str, Any]] = []
+        # 迟到重判记录：值班员选择的时间依据先落库，再决定侧输出归属
+        self._late_rejudges: dict[int, dict[str, Any]] = {}
+        # 每条策略最近一次判定使用的事件输入，供未带事件的补判/重判复用
+        self._late_inputs: dict[int, list[dict[str, Any]]] = {}
+        self._late_seq = 0
+        self._late_batch_seq = 0
+        self._late_rejudge_seq = 0
         # 快照存储表（snapshot_mgr → backfill_job 共享）
         self._snapshot_store: dict[str, dict[str, Any]] = {}
         # 血缘图（lineage → table_format 共享）
@@ -204,11 +220,139 @@ class Store:
         return {"compatible": True, "reason": "向后兼容"}
 
     # ---------- 水位记录 ----------
+    @property
+    def lock(self) -> threading.RLock:
+        """跨模块共享的原子操作锁：消费进度推进与迟到判定互斥。"""
+        return self._store_lock
+
     def update_watermark(self, partition: str, offset: dict[str, Any]) -> None:
-        self._watermark_offsets[partition] = offset
+        """推进消费水位。只有确认位点真正前进才递增确认版本。
+
+        重复提交同一确认时刻（例如并发重放）返回同一版本，迟到判定因此只会
+        看到同一份确认时刻；位点回退同样不递增版本，避免把已确认进度改小。
+        """
+        with self._store_lock:
+            previous = self._watermark_offsets.get(partition)
+            confirmed = True
+            if previous is not None:
+                try:
+                    confirmed = float(offset.get("offset")) > float(previous.get("offset"))
+                except (TypeError, ValueError):
+                    # 无法比较时按不使用可靠时刻处理，不递增版本
+                    confirmed = False
+            if confirmed:
+                self._watermark_version += 1
+                offset = {**offset, "version": self._watermark_version}
+            else:
+                keep_version = (previous or {}).get("version", self._watermark_version)
+                offset = {**offset, "version": keep_version}
+            self._watermark_offsets[partition] = offset
 
     def get_watermark(self, partition: str) -> dict[str, Any] | None:
         return self._watermark_offsets.get(partition)
+
+    def watermark_progress(self, partition: str) -> dict[str, Any]:
+        """读取一个自洽的消费进度快照：确认时刻与确认版本同时定格。
+
+        返回 {offset, version, ts, confirmed}。缺少可靠确认时刻时 confirmed=False，
+        调用方不得据此把任何行判成迟到或丢弃。
+        """
+        with self._store_lock:
+            data = self._watermark_offsets.get(partition) or {}
+            offset = data.get("offset")
+            try:
+                offset_val = float(offset)
+                reliable = offset_val == offset_val  # 排除 NaN
+            except (TypeError, ValueError):
+                reliable = False
+            return {
+                "offset": offset if reliable else None,
+                "version": data.get("version", self._watermark_version),
+                "last_update": data.get("ts"),
+                "confirmed": reliable,
+                "has_record": bool(data),
+            }
+
+    # ---------- 迟到事件清单 / 侧输出 / 重判 ----------
+    def next_late_event_id(self) -> int:
+        with self._store_lock:
+            self._late_seq += 1
+            return self._late_seq
+
+    def next_late_batch_id(self, entry_id: int) -> str:
+        with self._store_lock:
+            self._late_batch_seq += 1
+            return f"LATE_{entry_id}_{self._late_batch_seq}"
+
+    def next_rejudge_id(self) -> int:
+        with self._store_lock:
+            self._late_rejudge_seq += 1
+            return self._late_rejudge_seq
+
+    def late_events_for_policy(self, entry_id: int) -> list[dict[str, Any]]:
+        return [e for e in self._late_events if e.get("policy_id") == entry_id]
+
+    def find_late_event(self, event_id: str, policy_id: int | None = None) -> dict[str, Any] | None:
+        for event in self._late_events:
+            if event.get("event_id") != event_id:
+                continue
+            if policy_id is not None and event.get("policy_id") != policy_id:
+                continue
+            return event
+        return None
+
+    def record_late_event(self, record: dict[str, Any]) -> dict[str, Any]:
+        self._late_events.append(record)
+        return record
+
+    def side_output_for_policy(self, entry_id: int) -> list[dict[str, Any]]:
+        return [
+            row for row in self._late_side_output
+            if row.get("policy_id") == entry_id and row.get("active")
+        ]
+
+    def all_side_output(self) -> list[dict[str, Any]]:
+        return [row for row in self._late_side_output if row.get("active")]
+
+    def sync_side_output(self, entry_id: int, rows: list[dict[str, Any]]) -> None:
+        """把某次判定的迟到行写进侧输出，并让不再迟到的旧行失效。
+
+        失效行不删除，保留原判定时刻与失效时间，便于复核"曾经进过侧输出"的记录。
+        """
+        with self._store_lock:
+            keep_ids = {row["event_id"] for row in rows}
+            for existing in self._late_side_output:
+                if existing.get("policy_id") != entry_id or not existing.get("active"):
+                    continue
+                if existing.get("event_id") not in keep_ids:
+                    existing["active"] = False
+                    existing["invalidated_at"] = time.time()
+            for row in rows:
+                for existing in self._late_side_output:
+                    if existing.get("event_id") == row["event_id"]:
+                        existing.update(row)
+                        existing["active"] = True
+                        existing.pop("invalidated_at", None)
+                        break
+                else:
+                    self._late_side_output.append({**row, "active": True})
+
+    def save_rejudge(self, record: dict[str, Any]) -> dict[str, Any]:
+        self._late_rejudges[record["rejudge_id"]] = record
+        return record
+
+    def find_rejudge(self, entry_id: int) -> dict[str, Any] | None:
+        matches = [r for r in self._late_rejudges.values() if r.get("policy_id") == entry_id]
+        return max(matches, key=lambda r: r["rejudge_id"]) if matches else None
+
+    def all_rejudges(self) -> list[dict[str, Any]]:
+        return [self._late_rejudges[key] for key in sorted(self._late_rejudges)]
+
+    def remember_late_input(self, entry_id: int, events: list[dict[str, Any]]) -> None:
+        self._late_inputs[entry_id] = [dict(event) for event in events]
+
+    def last_late_input(self, entry_id: int) -> list[dict[str, Any]]:
+        return [dict(event) for event in self._late_inputs.get(entry_id, [])]
 
     # ---------- 快照存储 ----------
     def save_snapshot(self, snap_id: str, data: dict[str, Any]) -> None:

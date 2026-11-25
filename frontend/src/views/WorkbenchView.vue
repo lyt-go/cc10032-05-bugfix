@@ -70,6 +70,66 @@
       </tbody>
     </table>
 
+    <section v-if="isLateData" class="late-panel" data-testid="late-panel">
+      <header class="late-panel-head">
+        <h3>迟到判定与侧输出核对</h3>
+        <label class="filter-item">
+          <span>策略 id</span>
+          <input v-model="latePolicyId" data-testid="late-policy-id" placeholder="选择左侧策略 id" />
+        </label>
+        <label class="filter-item">
+          <span>重判时间依据</span>
+          <input v-model="rejudgeBasis" data-testid="late-rejudge-basis" placeholder="发起重判所选确认时刻" />
+        </label>
+        <button class="btn" data-testid="late-refresh" type="button" @click="refreshLate">刷新</button>
+      </header>
+      <p v-if="lateError" class="error-text">{{ lateError }}</p>
+      <div class="late-columns">
+        <article>
+          <h4>迟到侧输出（共 {{ sideOutput.length }} 行）</h4>
+          <table class="data-table">
+            <thead><tr><th>事件</th><th>事件时刻</th><th>延迟</th><th>确认时刻</th><th>确认版本</th></tr></thead>
+            <tbody>
+              <tr v-for="item in sideOutput" :key="item.event_id" :data-testid="`side-${item.event_id}`">
+                <td>{{ item.event_id }}</td>
+                <td>{{ item.event_ts ?? '—' }}</td>
+                <td>{{ item.delay ?? '—' }}</td>
+                <td>{{ item.confirmed_at ?? '—' }}</td>
+                <td>{{ item.confirmation_version ?? '—' }}</td>
+              </tr>
+              <tr v-if="!sideOutput.length"><td colspan="5" class="empty-state">暂无侧输出行</td></tr>
+            </tbody>
+          </table>
+        </article>
+        <article>
+          <h4>分类结果与旧分类</h4>
+          <table class="data-table">
+            <thead><tr><th>事件</th><th>当前分类</th><th>延迟</th><th>旧分类</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr v-for="item in lateEvents" :key="item.event_id">
+                <td>{{ item.event_id }}</td>
+                <td>{{ item.classification }}</td>
+                <td>{{ item.delay ?? '—' }}</td>
+                <td>{{ item.original_classification?.classification ?? '—' }}</td>
+                <td>{{ item.reason }}</td>
+              </tr>
+              <tr v-if="!lateEvents.length"><td colspan="5" class="empty-state">暂无分类结果</td></tr>
+            </tbody>
+          </table>
+        </article>
+      </div>
+      <article v-if="rejudge" class="late-rejudge">
+        <h4>迟到重判 #{{ rejudge.rejudge_id }}（{{ rejudge.status }}）</h4>
+        <p>时间依据：{{ rejudge.basis.confirmed_at ?? '—' }}，发起人：{{ rejudge.basis.requested_by }}</p>
+        <p v-if="rejudge.result">
+          重判引用时刻：{{ rejudge.result.time_basis ?? '—' }}，
+          确认版本：{{ rejudge.result.confirmation_version ?? '—' }}，
+          侧输出新增 {{ rejudge.result.side_output_added.join('、') || '无' }}、
+          移除 {{ rejudge.result.side_output_removed.join('、') || '无' }}
+        </p>
+      </article>
+    </section>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -100,10 +160,14 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadLateEvents,
+  loadLateRejudge,
+  loadLateSideOutput,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import type { LateEventRow, LateRejudgeResult, LateSideOutputRow } from '@/api/backend-service'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -133,6 +197,34 @@ const statusSummary = computed(() =>
 function resetFilters() {
   filters.value = {}
   void reload()
+}
+
+const isLateData = computed(() => meta.key === 'late_data')
+const latePolicyId = ref('')
+const sideOutput = ref<LateSideOutputRow[]>([])
+const lateEvents = ref<LateEventRow[]>([])
+const rejudge = ref<LateRejudgeResult['rejudge']>(null)
+const rejudgeBasis = ref('')
+const lateError = ref('')
+
+async function refreshLate() {
+  if (!isLateData.value) return
+  const id = Number(latePolicyId.value || rows.value[0]?.id)
+  if (!id) return
+  if (!latePolicyId.value) latePolicyId.value = String(id)
+  lateError.value = ''
+  try {
+    const [side, events, judge] = await Promise.all([
+      loadLateSideOutput(id),
+      loadLateEvents(id),
+      loadLateRejudge(id),
+    ])
+    sideOutput.value = side.items
+    lateEvents.value = events.items
+    rejudge.value = judge.rejudge
+  } catch (error) {
+    lateError.value = error instanceof Error ? error.message : '迟到判定结果读取失败'
+  }
 }
 
 async function exportRows() {
@@ -168,9 +260,18 @@ async function submitCreate() {
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
   try {
-    const result = await applyAction(meta.key, Number(row.id), action)
+    const id = Number(row.id)
+    // 发起迟到重判时必须带上值班员选择的确认时刻依据；其余动作原样下发。
+    const basis = action === '发起迟到重判' && rejudgeBasis.value
+      ? { confirmed_at: Number(rejudgeBasis.value) }
+      : {}
+    const result = await applyAction(meta.key, id, action, basis)
     if (!result.ok) throw new Error(result.message)
     await reload()
+    if (isLateData.value) {
+      latePolicyId.value = String(id)
+      await refreshLate()
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
@@ -182,6 +283,10 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (isLateData.value && !latePolicyId.value && rows.value.length) {
+      latePolicyId.value = String(rows.value[0].id)
+      await refreshLate()
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }
